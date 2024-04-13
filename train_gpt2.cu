@@ -631,7 +631,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_sizes[i];
-    }
+    } 
     // malloc all parameters all at once on the device
     float* params_memory;
     if (on_device) {

@@ -586,6 +586,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     FILE *model_file = fopen(checkpoint_path, "rb");
     if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
     int model_header[256];
+
     fread(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(1); }
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
@@ -1046,9 +1047,175 @@ int sample_mult(float* probabilities, int n, float coin) {
     return n - 1; // in case of rounding errors
 }
 
+
+//////////////////////////////////////////////////////////////////////for testing
+int test_matmul() {
+    // Dimensions for matrix multiplication
+    int B = 1, T = 3, C = 4, OC = 2;
+    float x[B*T*C];  // Input matrix X
+    float w[OC*C];   // Weight matrix W
+    float b[OC];     // Bias vector B
+    float y[B*T*OC]; // Output matrix Y
+    float dy[B*T*OC]; // Fake Gradient w.r.t Y
+    float dx[B*T*C];  // Gradient w.r.t. X
+    float dw[OC*C];   // Gradient w.r.t. Weights
+    float db[OC];     // Gradient w.r.t. Biases
+
+    // Initialize x, w, b, dy manually
+    float temp_x[] = {0.1, -0.2, 0.3, 0.4, 0.5, -0.6, 0.7, 0.8, 0.9, 1.0, -1.1, 1.2};
+    float temp_w[] = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8};
+    float temp_b[] = {0.1, -0.1};
+    float temp_dy[] = {0.1, -0.2, -1.0, -0.8, 1.0, 1.0};
+
+    for (int i = 0; i < B*T*C; i++) {
+        x[i] = temp_x[i];
+    }
+    for (int i = 0; i < OC*C; i++) {
+        w[i] = temp_w[i];
+    }
+    for (int i = 0; i < OC; i++) {
+        b[i] = temp_b[i];
+    }
+    for (int i = 0; i < B*T*OC; i++) {
+        dy[i] = temp_dy[i];
+    }
+
+    // Perform matrix multiplication
+    matmul_forward(y, x, w, b, B, T, C, OC);
+    matmul_backward(dx, dw, db, dy, x, w, B, T, C, OC);
+
+    // Print the matrices
+    printf("Input X (Shape BxTxC = %dx%dx%d):\n", B, T, C);
+    for (int i = 0; i < B*T*C; i++) {
+        printf("%6.2f ", x[i]);
+        if ((i+1) % C == 0) printf("\n");
+    }
+    printf("\n");
+
+    printf("Output Y (Shape BxTxC = %dx%dx%d):\n", B, T, OC);
+    for (int i = 0; i < B*T*OC; i++) {
+        printf("%6.2f ", y[i]);
+        if ((i+1) % OC == 0) printf("\n");
+    }
+    printf("\n");
+
+    printf("Gradient w.r.t. X (dx) (Shape BxTxC = %dx%dx%d):\n", B, T, C);
+    for (int i = 0; i < B*T*C; i++) {
+        printf("%6.2f ", dx[i]);
+        if ((i+1) % C == 0) printf("\n");
+    }
+    printf("\n");
+
+    printf("Gradient w.r.t. Weights (dw) (Shape CxOC = %dx%d):\n", C, OC);
+    for (int i = 0; i < OC*C; i++) {
+        printf("%6.2f ", dw[i]);
+        if ((i+1) % C == 0) printf("\n");
+    }
+    printf("\n");
+
+    printf("Gradient w.r.t. Biases (db) (Shape OC = %d):\n", OC);
+    for (int i = 0; i < OC; i++) {
+        printf("%6.2f ", db[i]);
+    }
+    printf("\n\n");
+
+    return 0;
+}
+
+
+int test_layernorm() {
+    // Dimensions for layernorm
+    int B = 1, T = 3, C = 2;
+    float x[B*T*C];   // Input matrix X
+    float mean[B*T];  // Mean vector
+    float rstd[B*T];  // Reciprocal standard deviation vector
+    float w[C];       // Weight vector
+    float b[C];       // Bias vector
+    float y[B*T*C];   // Output matrix Y
+    float dy[B*T*C];  // Fake Gradient w.r.t Y
+    float dx[B*T*C];  // Gradient w.r.t. X
+    float dw[C];      // Gradient w.r.t. Weights
+    float db[C];      // Gradient w.r.t. Biases
+
+    // Initialize x, mean, rstd, w, b, dy manually
+    float temp_x[] = {0.1, -0.2, 0.3, 0.4, 0.5, -0.6, 0.7, 0.8, 0.9, 1.0, -1.1, 1.2};
+    float temp_mean[] = {0.1, 0.2, 0.3};
+    float temp_rstd[] = {0.1, 0.2, 0.3};
+    float temp_w[] = {0.1, 0.2, 0.3, 0.4};
+    float temp_b[] = {0.1, -0.1, 0.1, -0.1};
+    float temp_dy[] = {0.1, -0.2, -1.0, -0.8, 1.0, 1.0};
+
+    for (int i = 0; i < B*T*C; i++) {
+        x[i] = temp_x[i];
+    }
+    for (int i = 0; i < B*T; i++) {
+        mean[i] = temp_mean[i];
+        rstd[i] = temp_rstd[i];
+    }
+    for (int i = 0; i < C; i++) {
+        w[i] = temp_w[i];
+        b[i] = temp_b[i];
+    }
+    for (int i = 0; i < B*T*C; i++) {
+        dy[i] = temp_dy[i];
+    }
+
+    // Perform layernorm
+    layernorm_forward(y, mean, rstd, x, w, b, B, T, C);
+    layernorm_backward(dx, dw, db, dy, x, w, mean, rstd, B, T, C);
+
+    // Print the matrices
+    printf("Input X (Shape BxTxC = %dx%dx%d):\n", B, T, C);
+    for (int i = 0; i < B*T*C; i++) {
+        printf("%6.2f ", x[i]);
+        if ((i+1) % C == 0) printf("\n");
+    }
+    printf("\n");
+
+    printf("Output Y (Shape BxTxC = %dx%dx%d):\n", B, T, C);
+    for (int i = 0; i < B*T*C; i++) {
+        printf("%6.2f ", y[i]);
+        if ((i+1) % C == 0) printf("\n");
+    }
+    printf("\n");
+
+    printf("Gradient w.r.t. X (dx) (Shape BxTxC = %dx%dx%d):\n", B, T, C);
+    for (int i = 0; i < B*T*C; i++) {
+        printf("%6.2f ", dx[i]);
+        if ((i+1) % C == 0) printf("\n");
+    }
+    printf("\n");
+
+    printf("Gradient w.r.t. Weights (dw) (Shape C = %d):\n", C);
+    for (int i = 0; i < C; i++) {
+        printf("%6.2f ", dw[i]);
+    }
+    printf("\n");
+
+    printf("Gradient w.r.t. Biases (db) (Shape C = %d):\n", C);
+    for (int i = 0; i < C; i++) {
+        printf("%6.2f ", db[i]);
+    }
+    printf("\n\n");
+
+    return 0;
+}
+
+
+
+//////////////////////////////////////////////////////////////////////for testing
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
+
+    // testing modules
+    // test_matmul();
+    test_layernorm();
+    return 0;
+
+
+
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
