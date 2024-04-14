@@ -3,3 +3,4 @@ data/
 *.bin
 train_gpt2
 test_matmul
+train_gpt2cu
