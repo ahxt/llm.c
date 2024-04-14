@@ -4,3 +4,6 @@ data/
 train_gpt2
 test_matmul
 train_gpt2cu
+test_arrayadd
+test_array1dadd
+test_array2dadd
