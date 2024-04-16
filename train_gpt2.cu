@@ -4,6 +4,7 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <assert.h>
@@ -49,6 +50,78 @@ static void* cublaslt_workspace = NULL;
 static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
 cublasLtHandle_t cublaslt_handle;
+
+// ----------------------------------------------------------------------------
+// fread convenience utils, with nice handling of error checking using macros
+// simple replace fopen, fread, fclose with fopenCheck, freadCheck, fcloseCheck
+
+FILE *fopen_check(const char *path, const char *mode, const char *file, int line) {
+    FILE *fp = fopen(path, mode);
+    if (fp == NULL) {
+        fprintf(stderr, "Error: Failed to open file '%s' at %s:%d\n", path, file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Path: %s\n", path);
+        fprintf(stderr, "  Mode: %s\n", mode);
+        exit(EXIT_FAILURE);
+    }
+    return fp;
+}
+
+#define fopenCheck(path, mode) fopen_check(path, mode, __FILE__, __LINE__)
+
+void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char *file, int line) {
+    size_t result = fread(ptr, size, nmemb, stream);
+    if (result != nmemb) {
+        if (feof(stream)) {
+            fprintf(stderr, "Error: Unexpected end of file at %s:%d\n", file, line);
+        } else if (ferror(stream)) {
+            fprintf(stderr, "Error: File read error at %s:%d\n", file, line);
+        } else {
+            fprintf(stderr, "Error: Partial read at %s:%d. Expected %zu elements, read %zu\n",
+                    file, line, nmemb, result);
+        }
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Expected elements: %zu\n", nmemb);
+        fprintf(stderr, "  Read elements: %zu\n", result);
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define freadCheck(ptr, size, nmemb, stream) fread_check(ptr, size, nmemb, stream, __FILE__, __LINE__)
+
+void fclose_check(FILE *fp, const char *file, int line) {
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "Error: Failed to close file at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
+
+// ----------------------------------------------------------------------------
+// malloc error-handling wrapper util
+
+void *malloc_check(size_t size, const char *file, int line) {
+    void *ptr = malloc(size);
+    if (ptr == NULL) {
+        fprintf(stderr, "Error: Memory allocation failed at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Size: %zu bytes\n", size);
+        exit(EXIT_FAILURE);
+    }
+    return ptr;
+}
+
+#define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
 
 // ----------------------------------------------------------------------------
 // all the kernels
@@ -409,6 +482,102 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     }
 }
 
+__global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
+                           const float* dlosses, const float* probs, const int* targets,
+                           int B, int T, int V) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < B * T * V) {
+        int b = i / (T * V);
+        int t = (i / V) % T;
+        int v = i % V;
+        float* dlogits_bt = dlogits + b * T * V + t * V;
+        const float* probs_bt = probs + b * T * V + t * V;
+        float dloss = dlosses[b * T + t];
+        int ix = targets[b * T + t];
+        float p = probs_bt[v];
+        float indicator = v == ix ? 1.0f : 0.0f;
+        dlogits_bt[v] += (p - indicator) * dloss;
+    }
+}
+
+__global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* dout, int B, int T, int OC) {
+    extern __shared__ float shared[];
+    int o = blockIdx.x; // range [0, OC)
+    int tid = threadIdx.x; // range [0, block_size)
+    int block_size = blockDim.x;
+    const float* x = dout + o;
+    // thread coarsening
+    double sum = 0.0f;
+    for (int i = tid; i < B * T; i += block_size) {
+        sum += x[i * OC];
+    }
+    shared[tid] = (float) sum;
+    __syncthreads();
+    // reductions
+    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+    }
+    // write the final result (at thread 0) to global memory
+    if (tid == 0) {
+        dbias[o] = shared[0];
+    }
+}
+
+// super naive layernorm backward kernel that just parallelizes over B,T and loops over C
+__global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        int B, int T, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B*T) return;
+    int b = idx / T;
+    int t = idx % T;
+
+    float* dout_bt = dout + b * T * C + t * C;
+    float* inp_bt = inp + b * T * C + t * C;
+    float* dinp_bt = dinp + b * T * C + t * C;
+    float mean_bt = mean[b * T + t];
+    float rstd_bt = rstd[b * T + t];
+
+    // first: two reduce operations
+    float dnorm_mean = 0.0f;
+    float dnorm_norm_mean = 0.0f;
+    for (int i = 0; i < C; i++) {
+        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = weight[i] * dout_bt[i];
+        dnorm_mean += dnorm_i;
+        dnorm_norm_mean += dnorm_i * norm_bti;
+    }
+    dnorm_mean = dnorm_mean / C;
+    dnorm_norm_mean = dnorm_norm_mean / C;
+
+    // now iterate again and accumulate all the gradients
+    for (int i = 0; i < C; i++) {
+        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = weight[i] * dout_bt[i];
+        // gradient contribution to bias
+        atomicAdd(&dbias[i], dout_bt[i]);
+        // gradient contribution to weight
+        atomicAdd(&dweight[i], norm_bti * dout_bt[i]);
+        // gradient contribution to input
+        float dval = 0.0f;
+        dval += dnorm_i; // term 1
+        dval -= dnorm_mean; // term 2
+        dval -= norm_bti * dnorm_norm_mean; // term 3
+        dval *= rstd_bt; // final scale
+        dinp_bt[i] += dval;
+    }
+}
+
+__global__ void setConstant(float* vec, float constant, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        vec[idx] = constant;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -556,7 +725,7 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
                                      B * NH);
     if (stat != CUBLAS_STATUS_SUCCESS) {
         printf("cublasSgemm failed\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // multiply all elements of preatt elementwise by scale
@@ -577,7 +746,7 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
                                      B * NH);
     if (stat != CUBLAS_STATUS_SUCCESS) {
         printf("cublasSgemm failed\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // now unpermute
@@ -618,6 +787,44 @@ void crossentropy_forward(float* losses,
     cudaCheck(cudaGetLastError());
 }
 
+void crossentropy_softmax_backward(float* dlogits,
+                           const float* dlosses, const float* probs, const int* targets,
+                           int B, int T, int V) {
+    const int block_size = 256;
+    const int N = B * T * V;
+    const int grid_size = CEIL_DIV(N, block_size);
+    crossentropy_softmax_backward_kernel1<<<grid_size, block_size>>>(dlogits, dlosses, probs, targets, B, T, V);
+    cudaCheck(cudaGetLastError());
+}
+
+void matmul_backward(float* dinp, float* dweight, float* dbias,
+                     float* dout, float* inp, float* weight, float* ones,
+                     int B, int T, int C, int OC) {
+    float alpha = 1.0f;
+    float beta = 1.0f; // note we must use beta = 1.0 so that we do a +=, as we should, because gradients add
+    // backward to input
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &alpha, weight, C, dout, OC, &beta, dinp, C));
+    // backward to weight
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &alpha, inp, C, dout, OC, &beta, dweight, C));
+    // backward to bias, if given
+    if (dbias != NULL) {
+        const int block_size=512;
+        dim3 block_dim(block_size);
+        dim3 grid_dim(OC);
+        size_t shared_mem_size = block_size * sizeof(float);
+        matmul_backward_bias_kernel_faster<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC);
+    }
+}
+
+void layernorm_backward(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        int B, int T, int C) {
+    const int block_size = 64;
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N, block_size);
+    layernorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+}
+
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
 
@@ -656,7 +863,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     if (on_device) {
         cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
     } else {
-        params_memory = (float*)malloc(num_parameters * sizeof(float));
+        params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     }
     // assign all the tensors their place in the array
     float** ptrs[] = {
@@ -739,7 +946,7 @@ typedef struct {
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
     float* params_memory;
-    int num_parameters;
+    size_t num_parameters;
     // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
@@ -750,7 +957,7 @@ typedef struct {
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     float* acts_memory;
-    int num_activations;
+    size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
     float* grads_acts_memory;
@@ -767,12 +974,11 @@ typedef struct {
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
-    FILE *model_file = fopen(checkpoint_path, "rb");
-    if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
+    FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
-    fread(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(1); }
-    if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
+    freadCheck(model_header, sizeof(int), 256, model_file);
+    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
+    if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
 
     // read in hyperparameters
     int maxT, V, L, NH, C;
@@ -806,7 +1012,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->param_sizes[14] = C; // lnfw
     model->param_sizes[15] = C; // lnfb
 
-    // cound the number of paramaters
+    // count the number of parameters
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += model->param_sizes[i];
@@ -818,11 +1024,11 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)malloc(num_parameters * sizeof(float));
-    fread(params_memory_cpu, sizeof(float), num_parameters, model_file);
+    float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
+    freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(params_memory_cpu);
-    fclose(model_file);
+    fcloseCheck(model_file);
 
     // other inits
     model->acts_memory = NULL;
@@ -832,6 +1038,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->grads_acts_memory = NULL;
     model->inputs = NULL;
     model->targets = NULL;
+    model->cpu_losses = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
@@ -843,7 +1050,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // convenience parameters
@@ -903,12 +1110,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     } else {
-        // validate B,T is no larger than what was previously allocated
-        // in principle, we could re-allocate a larger chunk of memory, for now we just error out
-        if (B > model->batch_size || T > model->seq_len) {
-            printf("Error: batch size or sequence length is inadequately large\n");
+        // validate B,T is consistent with how we've allocated the memory before
+        // in principle we could get more clever here in the future, for now this is safest
+        if (B != model->batch_size || T != model->seq_len) {
             printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
-            exit(1);
+            exit(EXIT_FAILURE);
         }
     }
 
@@ -1008,7 +1214,7 @@ void gpt2_backward(GPT2 *model) {
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
@@ -1021,24 +1227,29 @@ void gpt2_backward(GPT2 *model) {
     // convenience shortcuts
     int B = model->batch_size;
     int T = model->seq_len;
-    // int V = model->config.vocab_size;
-    // int L = model->config.num_layers;
+    int V = model->config.vocab_size;
+    int L = model->config.num_layers;
     // int NH = model->config.num_heads;
-    // int C = model->config.channels;
+    int C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
-    // ParameterTensors params = model->params; // for brevity
-    // ParameterTensors grads = model->grads;
-    // ActivationTensors acts = model->acts;
+    ParameterTensors params = model->params; // for brevity
+    ParameterTensors grads = model->grads;
+    ActivationTensors acts = model->acts;
     ActivationTensors grads_acts = model->grads_acts;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // technically this is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     float dloss_mean = 1.0f / (B*T);
-    cudaCheck(cudaMemset(grads_acts.losses, dloss_mean, B*T * sizeof(float)));
-
-    // crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
+    setConstant<<<CEIL_DIV(B*T, 256), 256>>>(grads_acts.losses, dloss_mean, B*T); // silly; to refactor later
+    crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
+    // backward the classifier matmul
+    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
+    // backward the final layernorm
+    float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+    float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // and its gradient
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 }
 
 void gpt2_free(GPT2 *model) {
@@ -1081,11 +1292,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->T = T;
 
     // open the input file for reading
-    loader->tokens_file = fopen(filename, "rb");
-    if (loader->tokens_file == NULL) {
-        printf("Error opening tokens file\n");
-        exit(1);
-    }
+    loader->tokens_file = fopenCheck(filename, "rb");
 
     // determine the file size
     fseek(loader->tokens_file, 0, SEEK_END);
@@ -1093,7 +1300,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     fseek(loader->tokens_file, 0, SEEK_SET);
     if (loader->file_size < (B * T + 1) * sizeof(int)) {
         printf("Error: file size is too small for the batch size and sequence length\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
     loader->current_position = 0; // start at the beginning
 
@@ -1119,13 +1326,13 @@ void dataloader_next_batch(DataLoader *loader) {
     }
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
-    fread(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
+    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T integers
     loader->current_position += B*T * sizeof(int);
 }
 
 void dataloader_free(DataLoader *loader) {
-    fclose(loader->tokens_file);
+    fcloseCheck(loader->tokens_file);
     cudaFreeHost(loader->batch);
 }
 
@@ -1157,6 +1364,86 @@ int sample_mult(float* probabilities, int n, float coin) {
         }
     }
     return n - 1; // in case of rounding errors
+}
+
+// ----------------------------------------------------------------------------
+// Tokenizer (only supports decoding)
+
+typedef struct {
+    uint32_t vocab_size;
+    char **token_table;
+    int init_ok;
+} Tokenizer;
+
+void safe_printf(const char *piece) {
+    // the tokens are raw bytes, and we we only want to print the printable ones
+    // many bytes can be various control codes, backspace, etc.
+    if (piece == NULL) { return; }
+    if (piece[0] == '\0') { return; }
+    // handle individual byte tokens
+    // every token is asserted to be at least one byte so doing piece[1] is ok
+    if (piece[1] == '\0') {
+        unsigned char byte_val = piece[0];
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return; // weird byte, don't print it
+        }
+    }
+    printf("%s", piece);
+}
+
+void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (file == NULL) {
+        // try to be more helpful as we just added this feature, erase later
+        printf("---\n");
+        printf("WARNING: Failed to open the tokenizer file %s\n", filename);
+        printf("The Tokenizer is a new feature added April 14 2024.\n");
+        printf("Re-run `python train_gpt2.py` to write it\n");
+        printf("---\n");
+        tokenizer->init_ok = 0;
+        return;
+    }
+    // read in the header
+    uint32_t header[256];
+    freadCheck(header, sizeof(uint32_t), 256, file);
+    assert(header[0] == 20240328);
+    assert(header[1] == 1);
+    tokenizer->vocab_size = header[2];
+    // read in all the tokens
+    unsigned char length;
+    tokenizer->token_table = (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
+    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+        freadCheck(&length, sizeof(unsigned char), 1, file);
+        assert(length > 0); // every token should be at least one character
+        char *token_bytes = (char *)mallocCheck(length + 1);
+        freadCheck(token_bytes, sizeof(char), length, file);
+        token_bytes[length] = '\0';  // Add null terminator for printing
+        tokenizer->token_table[i] = token_bytes;
+    }
+    // cleanups
+    fcloseCheck(file);
+    tokenizer->init_ok = 1;
+}
+
+const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
+    if (tokenizer->init_ok == 0) {
+        return NULL;
+    }
+    if (token_id < tokenizer->vocab_size) {
+        return tokenizer->token_table[token_id];
+    } else {
+        printf("invalid token id %d!\n", token_id);
+        return NULL;
+    }
+}
+
+void tokenizer_free(Tokenizer *tokenizer) {
+    if (tokenizer->init_ok) {
+        for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+            free(tokenizer->token_table[i]);
+        }
+        free(tokenizer->token_table);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1207,11 +1494,15 @@ int main() {
     printf("sequence length: %d\n", T);
     printf("val_num_batches: %d\n", val_num_batches);
 
+    // build the Tokenizer
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    const int gen_max_length = 64;
-    int gen_tokens[gen_max_length];
-    float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
+    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    const int genT = 64; // number of steps of inference we will do
+    float* cpu_probs = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // train
     struct timespec start, end;
@@ -1232,31 +1523,39 @@ int main() {
 
         // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
-
-            // the GPT-2 EOT token kicks off the generation
-            for(int i = 0; i < gen_max_length; ++i) {
+            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+            for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = GPT2_EOT;
             }
-
-            for (int t = 1; t < gen_max_length; t++) {
-                // note that inference is wasteful here because
-                // for each t, we re-compute all activations between 0 and t
-                // leaving this alone because you want separate code for inference anyway
-                // the inference here is just for sanity checking purposes
-                int t4 = (t + 3) & ~3; // clever way to round up to multiple of 4
-                gpt2_forward(&model, gen_tokens, NULL, 1, t4);
+            // now sample from the model autoregressively
+            printf("generating:\n---\n");
+            for (int t = 1; t < genT; t++) {
+                // note that inference is very wasteful here because for each token
+                // we re-calculate the forward pass for all of (B,T) positions from scratch
+                // but the inference here is just for sanity checking anyway
+                // and we can maybe optimize a bit more later, with careful tests
+                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+                // we're in principle running B "inference streams" in parallel here
+                // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
+                // get the V-dimensional vector probs[0, t-1, :]
                 float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
-                float coin = random_f32(&rng_state);
                 // move probs back to CPU and sample
                 cudaCheck(cudaMemcpy(cpu_probs, probs, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+                float coin = random_f32(&rng_state);
                 int next_token = sample_mult(cpu_probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
+                // print the generated token, either using the Tokenizer or a fallback
+                if (tokenizer.init_ok) {
+                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                    safe_printf(token_str);
+                } else {
+                    // fall back to printing the token id
+                    printf("%d ", next_token);
+                }
+                fflush(stdout);
             }
-            printf("generated: ");
-            for (int t = 0; t < gen_max_length; t++) {
-                printf("%d ", gen_tokens[t]);
-            }
-            printf("\n");
+            printf("\n---\n");
         }
 
         // do a training step
@@ -1275,8 +1574,10 @@ int main() {
     // free
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
+    tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(cpu_probs);
+    free(gen_tokens);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
