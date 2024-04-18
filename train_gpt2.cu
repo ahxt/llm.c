@@ -669,31 +669,37 @@ __global__ void setConstant(float* vec, float constant, int N) {
 
 // naive kernel to backward through an autoregressive softmax, just to get correctness
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
-                                                     int B, int T, int C, int NH) {
-    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t3 >= T) {
-        return;
-    }
+                                                       int B, int T, int C, int NH) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int t3 = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+
+    int idx = blockIdx.y * T * T;
+    if (t3 >= T) { return; }
 
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    int idx = blockIdx.y * T * T;
-
     for (int t = t3; t < T; t++) {
         float result = 0.0;
         const float* att_bth = att + idx + t*T;
         const float* datt_bth = datt + idx + t*T;
         float* dpreatt_bth = dpreatt + idx + t*T;
+        const float att_at_t3 = att_bth[t3];
 
-        for (int t2 = 0; t2 <= t; t2++) {
+        for (int t2 = warp.thread_rank(); t2 <= t; t2 += warp.size()) {
             float indicator = t2 == t3 ? 1.0f : 0.0f;
-            float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-            result += scale * local_derivative * datt_bth[t2];
+            float local_derivative = att_bth[t2] * (indicator - att_at_t3);
+            result += local_derivative * datt_bth[t2];
         }
 
-        dpreatt_bth[t3] += result;
+        result = cg::reduce(warp, result, cg::plus<float>());
+        if(warp.thread_rank() == 0) {
+            dpreatt_bth[t3] += scale * result;
+        }
     }
 }
+
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
@@ -1035,7 +1041,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
             B * NH);
 
     // backward into preatt
-    softmax_autoregressive_backward_kernel<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
+    softmax_autoregressive_backward_kernel<<<dim3(CEIL_DIV(B * T * C, block_size/32), B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
 
     // backward into q
     cublasSgemmStridedBatched(cublas_handle,
@@ -1154,7 +1160,6 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
         num_activations += act_sizes[i];
     }
     float* acts_memory;
-    printf("Allocating %d MB for activation buffer\n", int(num_activations * sizeof(float) / 1024 / 1024));
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
@@ -1815,16 +1820,25 @@ int main() {
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4;
     int T = 1024;
+    printf("batch size: %d\n", B);
+    printf("sequence length: %d\n", T);
+
+    // set up the dataloaders
     DataLoader train_loader;
     dataloader_init(&train_loader, train_tokens, B, T);
     printf("train dataset num_batches: %d\n", train_loader.num_batches);
     DataLoader val_loader;
     dataloader_init(&val_loader, val_tokens, B, T);
     printf("val dataset num_batches: %d\n", val_loader.num_batches);
-    int val_num_batches = 10;
-    printf("batch size: %d\n", B);
-    printf("sequence length: %d\n", T);
-    printf("val_num_batches: %d\n", val_num_batches);
+
+    // run configuration variables
+    // for now, let's do exactly 1 epoch of training
+    // and let's do 1 epoch of validation after every 10 steps
+    int val_num_batches = val_loader.num_batches;
+    int train_num_batches = train_loader.num_batches;
+    int val_loss_every = 20; // every how many steps do we eval validation loss?
+    int sample_every = 20; // every how many steps to do inference?
+    const int genT = 64; // number of steps of inference we will do
 
     // build the Tokenizer
     Tokenizer tokenizer;
@@ -1833,15 +1847,15 @@ int main() {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
-    const int genT = 64; // number of steps of inference we will do
     float* cpu_probs = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // train
     struct timespec start, end;
-    for (int step = 0; step <= 40; step++) {
+    for (int step = 0; step <= train_num_batches; step++) {
+        int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss
-        if (step % 10 == 0) {
+        if (step % val_loss_every == 0 || last_step) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
@@ -1854,7 +1868,7 @@ int main() {
         }
 
         // once in a while do model inference to print generated text
-        if (step > 0 && step % 20 == 0) {
+        if (step > 0 && step % sample_every == 0 || last_step) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = GPT2_EOT;
@@ -1890,17 +1904,23 @@ int main() {
             printf("\n---\n");
         }
 
+        // bit confusing: we want to make sure to eval and sample on 0th iteration
+        // but also after the very last iteration. so we loop for step <= train_num_batches
+        // instead of just < train_num_batches (one extra due to <=), only to do
+        // the validation/sampling one last time, and then we break right here as we're done.
+        if (last_step) { break; }
+
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        // gpt2_zero_grad(&model);
-        // gpt2_backward(&model);
-        // gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+        gpt2_zero_grad(&model);
+        gpt2_backward(&model);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        printf("step %d/%d: train loss %f (%f ms)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000);
     }
 
     // free
