@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 
 
-__global__ void addMatrixKernel(float* A, float* B, float* C, int numRows, int numCols) {
+__global__ void addMatrixKernel(__nv_bfloat16* A, __nv_bfloat16* B, __nv_bfloat16* C, int numRows, int numCols) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -20,15 +20,15 @@ int main() {
     int numRows = 4;  
     int numCols = 4;  
     int numElements = numRows * numCols;
-    size_t size = numElements * sizeof(float);
+    size_t size = numElements * sizeof(__nv_bfloat16);
 
     // Define and initialize host matrices
-    float h_A[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    float h_B[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    float h_C[16];  // Result matrix C
+    __nv_bfloat16 h_A[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    __nv_bfloat16 h_B[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    __nv_bfloat16 h_C[16];  // Result matrix C
 
     // Allocate device arrays
-    float *d_A, *d_B, *d_C;
+    __nv_bfloat16 *d_A, *d_B, *d_C;
     cudaMalloc((void **)&d_A, size);
     cudaMalloc((void **)&d_B, size);
     cudaMalloc((void **)&d_C, size);
