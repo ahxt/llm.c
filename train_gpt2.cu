@@ -30,6 +30,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 #define ENABLE_BF16
+// #define ENABLE_FP16
 
 #if defined(ENABLE_BF16)
 typedef __nv_bfloat16 floatX;
