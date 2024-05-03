@@ -2,7 +2,7 @@
 This code is a convenience tool for profiling the CUDA kernels in the training
 loop of train_gpt2.cu. Compile:
 
-make profile_gpt2.cu
+make profile_gpt2cu NO_MULTI_GPU=1
 
 And then e.g. use ncu from NVIDIA. The CLI docs for example:
 https://docs.nvidia.com/nsight-compute/NsightComputeCli/
@@ -34,6 +34,7 @@ int main() {
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cuda_num_SMs = deviceProp.multiProcessorCount;
     printf("[System]\n");
     printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
@@ -49,9 +50,13 @@ int main() {
     // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
+    #ifdef ENABLE_CUDNN
+    checkCudnnErr(cudnnCreate(&cudnn_handle));
+    #endif
+
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
     int B = 4;
     int T = 1024;
@@ -75,6 +80,11 @@ int main() {
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
     // free
     gpt2_free(&model);
+
+    #ifdef ENABLE_CUDNN
+    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
+    checkCudnnErr(cudnnDestroy(cudnn_handle));
+    #endif
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
